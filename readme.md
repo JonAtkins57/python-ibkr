@@ -79,10 +79,6 @@ python 01_monday_wheel.py --dryrun   # simulate only
 
 ## 💡 Example Account Setup
 
-From your IBKR dashboard:
-
-- ✅ $72,053 settled cash
-- 📈 $544K buying power
 - 🎯 Only risking $10K/week in wheel strategy initially
 
 ---
