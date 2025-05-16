@@ -5,7 +5,7 @@ import argparse
 from datetime import datetime, timedelta
 
 # ---- CONFIG ----
-UNDERLYINGS = ['TSLL', 'F', 'SNAP', 'OLO','LUMN','CLNE','PAYO']
+UNDERLYINGS = ['TSLL', 'F', 'SNAP', 'OLO','LUMN','CLNE','PAYO', 'TSLQ']
 MIN_RETURN = 0.02
 CASH_LIMIT = 10000
 CONTRACTS = 1
@@ -14,7 +14,7 @@ CLIENT_ID = 1
 DELAY = 1.5
 TRACKING_FILE = 'assigned_positions.csv'
 LOG_FILE = 'wheel_log.csv'
-MIN_CC_BID = 0.05  # Minimum premium to sell covered calls
+MIN_CC_BID = 0.50  # Minimum premium to sell covered calls
 
 # ---- DRYRUN FLAG ----
 parser = argparse.ArgumentParser()
@@ -53,7 +53,7 @@ else:
 
 wheel_log_rows = []
 
-# ---- STEP 2: Covered Calls ----
+# ---- STEP 2: Covered Calls (Select OTM Strike with Highest ROI) ----
 for symbol, shares in assigned_positions:
     if symbol not in active_symbols:
         continue
@@ -79,54 +79,74 @@ for symbol, shares in assigned_positions:
     ib.sleep(DELAY)
     current_price = float(market_price.last or market_price.close or 0)
     otm_strikes = [s for s in strikes if s > current_price]
-    if not otm_strikes:
-        continue
 
-    cc_strike = otm_strikes[0]
-    option = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry,
-                    strike=cc_strike, right='C', exchange='SMART',
-                    tradingClass=trading_class, multiplier=multiplier, currency='USD')
-    try:
-        ib.qualifyContracts(option)
-    except Exception as e:
-        print(f"❌ Could not qualify CC {symbol} {cc_strike}: {e}")
-        continue
+    best_row = None
+    best_roi = 0
 
-    cc_market = ib.reqMktData(option)
-    ib.sleep(DELAY)
-    bid = float(cc_market.bid or 0)
+    for cc_strike in otm_strikes:
+        option = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry,
+                        strike=cc_strike, right='C', exchange='SMART',
+                        tradingClass=trading_class, multiplier=multiplier, currency='USD')
+        try:
+            ib.qualifyContracts(option)
+        except Exception as e:
+            print(f"❌ Could not qualify CC {symbol} {cc_strike}: {e}")
+            continue
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = {
-        'Timestamp': timestamp,
-        'Type': 'SKIPPED' if bid < MIN_CC_BID else 'PLACED',
-        'OrderType': 'CC',
-        'Symbol': symbol,
-        'Strike': cc_strike,
-        'Bid': bid,
-        'ROI': '',  # Not as relevant for CCs
-        'OrderID': '',
-        'Qty': shares // 100,
-        'Action': 'SELL',
-        'Expiry': expiry,
-        'Status': '',
-    }
+        cc_market = ib.reqMktData(option)
+        ib.sleep(DELAY)
+        bid = float(cc_market.bid or 0)
+        roi = (bid * 100) / (current_price * 100) if current_price > 0 else 0
 
-    if bid < MIN_CC_BID:
-        print(f"[CC] {symbol} {expiry} Call ${cc_strike} bid only ${bid:.2f} (SKIPPED - less than ${MIN_CC_BID:.2f})")
-        row['Status'] = f"CC bid < ${MIN_CC_BID:.2f}"
-        wheel_log_rows.append(row)
-        continue
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = {
+            'Timestamp': timestamp,
+            'Type': '',
+            'OrderType': 'CC',
+            'Symbol': symbol,
+            'Strike': cc_strike,
+            'Bid': bid,
+            'ROI': roi,
+            'OrderID': '',
+            'Qty': shares // 100,
+            'Action': 'SELL',
+            'Expiry': expiry,
+            'Status': '',
+        }
 
-    print(f"[CC] {symbol} {expiry} Call ${cc_strike} @ ${bid:.2f}")
-    if not DRYRUN:
-        order = LimitOrder('SELL', shares // 100, bid, tif='GTC')
-        trade = ib.placeOrder(option, order)
-        row['OrderID'] = str(trade.order.orderId)
-        row['Status'] = "PLACED"
+        if bid < MIN_CC_BID or roi < MIN_RETURN:
+            row['Type'] = 'SKIPPED'
+            if bid < MIN_CC_BID:
+                row['Status'] = f"CC bid < ${MIN_CC_BID:.2f}"
+            else:
+                row['Status'] = f"CC ROI < {MIN_RETURN:.2%}"
+            wheel_log_rows.append(row)
+            continue
+
+        if roi > best_roi:
+            best_row = row.copy()
+            best_row['Type'] = 'PLACED'
+            best_row['Status'] = ''
+            best_row['Bid'] = bid
+            best_row['ROI'] = roi
+            best_row['Strike'] = cc_strike
+            # Save these in case multiple qualify, we want the highest ROI
+
+    if best_row:
+        print(f"[CC] {symbol} {expiry} Call ${best_row['Strike']} @ ${best_row['Bid']:.2f} (ROI: {best_row['ROI']:.2%})")
+        if not DRYRUN:
+            option = Option(symbol=symbol, lastTradeDateOrContractMonth=expiry,
+                            strike=best_row['Strike'], right='C', exchange='SMART',
+                            tradingClass=trading_class, multiplier=multiplier, currency='USD')
+            order = LimitOrder('SELL', shares // 100, best_row['Bid'], tif='GTC')
+            trade = ib.placeOrder(option, order)
+            best_row['OrderID'] = str(trade.order.orderId)
+            best_row['Status'] = "PLACED"
+        else:
+            best_row['Status'] = "DRYRUN"
+        wheel_log_rows.append(best_row)
     else:
-        row['Status'] = "DRYRUN"
-    wheel_log_rows.append(row)
+        print(f"[CC] {symbol} No OTM strikes met ROI/bid requirements.")
 
 # ---- STEP 3: Cash-Secured Puts ----
 used_cash = 0
